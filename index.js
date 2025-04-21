@@ -1,14 +1,21 @@
 import express from "express";
 import { Octokit } from "@octokit/core";
 import OpenAI from "openai";
+import { Readable } from "node:stream";
+import { fileURLToPath } from "url";
+import { dirname, join } from "path";
+import { promises as fs } from "node:fs";
 
+// __dirname を取得するための設定
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 const app = express();
 app.use(express.json());
 
 const port = Number(process.env.PORT || "3000");
 
-// 呼び出し可能な関数の定義 (Function Calling用)
+// 天気情報取得用のツール定義
 const WEATHER_FUNCTION = {
   name: "getWeather",
   description: "指定した都市の現在の天気情報を取得します。",
@@ -21,13 +28,34 @@ const WEATHER_FUNCTION = {
   },
 };
 
-// 固定の天気予報データを返すサンプル関数 (実際にはAPIを呼び出します)
+// 自己紹介情報取得用のツール定義
+const SELF_INTRODUCTION_FUNCTION = {
+  name: "getSelfIntroduction",
+  description: "自己紹介の内容を取得します。self-introduction.mdファイルの内容に基づいて回答します。",
+  parameters: {
+    type: "object",
+    properties: {},
+  },
+};
+
+// 固定値の天気予報を返す関数
 async function getWeather(city) {
   return {
     city,
     description: "晴れ",
     temperature: 22,
   };
+}
+
+// self-introduction.md を読み込んで返す関数
+async function getSelfIntroduction() {
+  const filePath = join(__dirname, "self-introduction.md");
+  try {
+    const content = await fs.readFile(filePath, "utf8");
+    return { content };
+  } catch (error) {
+    return { error: "self-introduction.mdファイルを読み込めませんでした" };
+  }
 }
 
 app.get("/", (req, res) => {
@@ -43,6 +71,7 @@ app.post("/", async (req, res) => {
   const payload = req.body;
   const messages = payload.messages;
 
+  // ユーザー名を含むシステムメッセージを先頭に追加
   messages.unshift({
     role: "system",
     content: `あなたはブラックビアード海賊のようにユーザー(@${user.data.login})に応答するアシスタントです。`,
@@ -53,28 +82,29 @@ app.post("/", async (req, res) => {
     apiKey: apiKey,
   });
 
-  // 初回呼び出し (stream: false) でFunction Callingを検知
+  // 最初は stream: false で関数呼び出しの有無を確認
   const initialCompletion = await openai.chat.completions.create({
     model: "gpt-4o",
     messages,
-    tools: [{ type: "function", function: WEATHER_FUNCTION }],
+    tools: [
+      { type: "function", function: WEATHER_FUNCTION },
+      { type: "function", function: SELF_INTRODUCTION_FUNCTION },
+    ],
     tool_choice: "auto",
     stream: false,
   });
 
   const message = initialCompletion.choices[0].message;
-  console.log("Function Calling:", message);
+  console.log("message", message);
 
-  // Function Callingが検出された場合の処理
   if (message.tool_calls && message.tool_calls.length > 0) {
     const functionCall = message.tool_calls[0].function;
 
+    // 天気情報の関数呼び出しの場合
     if (functionCall.name === "getWeather") {
-      const args = JSON.parse(functionCall.arguments);  
-      // 天気情報を取得するための関数を実行、結果：「晴れ」「22℃」
+      const args = JSON.parse(functionCall.arguments);
       const weather = await getWeather(args.city);
 
-      // ツール呼び出しの結果をモデルに返す
       messages.push(message);
       messages.push({
         role: "tool",
@@ -82,7 +112,7 @@ app.post("/", async (req, res) => {
         content: JSON.stringify(weather),
       });
 
-      // Functionの実行結果を使い最終レスポンスを生成 (stream: true)
+      // 2回目は stream: true で最終レスポンスを取得
       const stream = await openai.chat.completions.create({
         model: "gpt-4o",
         messages,
@@ -90,25 +120,47 @@ app.post("/", async (req, res) => {
       });
 
       res.setHeader("Content-Type", "text/event-stream");
-
       for await (const chunk of stream) {
         res.write(`data: ${JSON.stringify(chunk)}\n\n`);
       }
+      res.write("data: [DONE]\n\n");
+      res.end();
+      return;
+    }
 
+    // 自己紹介情報の関数呼び出しの場合
+    if (functionCall.name === "getSelfIntroduction") {
+      const intro = await getSelfIntroduction();
+
+      messages.push(message);
+      messages.push({
+        role: "tool",
+        tool_call_id: message.tool_calls[0].id,
+        content: JSON.stringify(intro),
+      });
+
+      const stream = await openai.chat.completions.create({
+        model: "gpt-4o",
+        messages,
+        stream: true,
+      });
+
+      res.setHeader("Content-Type", "text/event-stream");
+      for await (const chunk of stream) {
+        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+      }
       res.write("data: [DONE]\n\n");
       res.end();
       return;
     }
   }
 
-  // Function Callingがない場合の通常応答処理
+  // function callingがない場合もstreamで返す
   const fallbackStream = await openai.chat.completions.create({
     model: "gpt-4o",
     messages,
     stream: true,
   });
-
-  res.setHeader("Content-Type", "text/event-stream");
 
   for await (const chunk of fallbackStream) {
     res.write("data: " + JSON.stringify(chunk) + "\n\n");
